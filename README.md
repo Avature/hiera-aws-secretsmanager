@@ -19,8 +19,7 @@
 
 An opinionated Hiera 5 `lookup_key` function for AWS Secrets Manager.
 Fetches secrets via the local [AWS Secrets Manager Agent] daemon,
-with support for multi-account lookups using cross-account resource
-policies.
+with support for multi-account lookups using IAM role assumption.
 
 [AWS Secrets Manager Agent]: https://github.com/aws/aws-secretsmanager-agent
 
@@ -51,15 +50,7 @@ Puppet server. It acts as a local HTTP proxy that caches and serves
 secrets from AWS Secrets Manager.
 
 See the [agent documentation](https://github.com/aws/aws-secretsmanager-agent/blob/main/README.md)
-for installation and configuration instructions. A minimal agent
-configuration example:
-
-```toml
-[config]
-http_port = 2773
-region = "us-east-1"
-ttl_seconds = 300
-```
+for installation and configuration instructions.
 
 The agent listens on `localhost:2773` by default and requires an SSRF
 token for authentication.
@@ -86,25 +77,46 @@ For **same-account** secrets, the agent's IAM role needs:
 }
 ```
 
-For **cross-account** secrets, you also need a resource policy on
-each remote secret allowing the agent's IAM role to read it:
+For **cross-account** secrets, the agent assumes an IAM role in the
+target account via the `roleArn` query parameter. You need:
+
+1. A role in the target account that allows reading the secrets:
 
 ``` json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowCrossAccountAccess",
+      "Sid": "AllowPuppetSecrets",
       "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::AGENT_ACCOUNT_ID:role/AGENT_ROLE_NAME"
-      },
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "*"
+      "Resource": "arn:aws:secretsmanager:*:*:secret:puppet/*"
     }
   ]
 }
 ```
+
+2. A trust policy on that role allowing the agent's IAM role to
+   assume it:
+
+``` json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCrossAccountAssume",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::AGENT_ACCOUNT_ID:role/AGENT_ROLE_NAME"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+3. The agent's own IAM role must be allowed to call `sts:AssumeRole`
+   on the target role.
 
 ## Usage
 
@@ -122,24 +134,21 @@ hierarchy:
     uris:
       - "secrets/%{::environment}"
     options:
-      region: us-east-1
       agent_port: 2773            # optional, default 2773
       agent_host: localhost        # optional, default localhost
       ssrf_env_var: AWS_TOKEN      # env var containing the SSRF token
       default_account: main        # optional, fallback for unprefixed keys
       accounts:
         main:
-          account_id: "123456789012"
+          role_arn: "arn:aws:iam::123456789012:role/PuppetSecretsRole"
         staging:
-          account_id: "987654321098"
-          region: eu-west-1        # optional per-account region override
+          role_arn: "arn:aws:iam::987654321098:role/PuppetSecretsRole"
 ```
 
 #### Options Reference
 
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `region` | yes | - | Default AWS region (used for ARN construction) |
 | `agent_host` | no | `localhost` | Hostname of the Secrets Manager Agent |
 | `agent_port` | no | `2773` | Port of the Secrets Manager Agent |
 | `ssrf_env_var` | no | - | Environment variable name containing the SSRF token |
@@ -150,8 +159,7 @@ Each entry under `accounts` supports:
 
 | Key | Required | Description |
 |---|---|---|
-| `account_id` | yes | AWS account ID |
-| `region` | no | Region override (falls back to top-level `region`) |
+| `role_arn` | yes | IAM role ARN for the agent to assume in the target account |
 
 ### Multi-Account Support
 
@@ -171,16 +179,14 @@ lookup('staging:-myapp::database::password')
 lookup('myapp::database::password')
 ```
 
-The plugin resolves the account name to an AWS account ID from the
-`accounts` configuration and constructs the full secret ARN:
-
-```
-arn:aws:secretsmanager:<region>:<account_id>:secret:<uri>/<translated_key>
-```
+The plugin resolves the account name to a `role_arn` from the
+`accounts` configuration and passes it as a query parameter to the
+AWS Secrets Manager Agent. The agent assumes the given IAM role
+to fetch the secret from the target account.
 
 If no account prefix is given and `default_account` is set, the
-default account is used. If `default_account` is not set, the plain
-secret path is used (same-account lookup without ARN).
+default account's `role_arn` is used. If `default_account` is not
+set, the request is made without a `roleArn` (same-account lookup).
 
 ### Convention
 
@@ -221,12 +227,11 @@ client.update_secret(secret_id: 'puppet/production/secret_key', secret_string: n
 
 #### Character Translation In Secret Names
 
-Secret IDs must be valid ARNs, which gives syntactical meaning to
-`:`. In order to accommodate the Puppet convention of
-`module::class::parameter`, the key portion (after stripping the
-account prefix) has `:` replaced by `=` before being looked up.
-Unfortunately this means humans managing secrets will have to do this
-translation in wetware.
+AWS Secrets Manager does not allow `:` in secret names. In order to
+accommodate the Puppet convention of `module::class::parameter`, the
+key portion (after stripping the account prefix) has `:` replaced by
+`=` before being looked up. Unfortunately this means humans managing
+secrets will have to do this translation in wetware.
 
 For a concrete example, assume a class definition like:
 
@@ -261,16 +266,16 @@ aws secretsmanager create-secret --name puppet/production/mymod==myclass==passwo
 
 1. Paths in Secrets Manager may not have a leading `/`.
 1. URIs in the hiera configuration must not have a trailing `/`.
-1. The `region` option is required and is used for ARN construction.
 1. The AWS Secrets Manager Agent must be running and accessible.
 1. The SSRF token environment variable must be available in the
    Puppet process's environment when `ssrf_env_var` is configured.
 
 ### Caching
 
-Fetched secrets are cached in the Puppet lookup context for the
-duration of the catalog compilation. Subsequent lookups for the same
-secret will use the cached value without contacting the agent.
+Caching is handled entirely by the AWS Secrets Manager Agent. Each
+lookup contacts the agent, which serves secrets from its local cache
+when possible. See the [agent documentation](https://github.com/aws/aws-secretsmanager-agent/blob/main/README.md)
+for cache TTL and configuration options.
 
 ## Limitations
 
@@ -281,6 +286,4 @@ from the secret, nor skip JSON parsing.
 Secret names are unconditionally translated to replace `:` with `=`.
 The `=` was chosen merely for visual similarity to `:` and is not
 configurable.
-
-The region option is the only way to set AWS Region and is required.
 

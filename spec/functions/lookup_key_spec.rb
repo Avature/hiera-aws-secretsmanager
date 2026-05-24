@@ -10,21 +10,20 @@ describe :hiera_aws_secretsmanager do
 
   let (:key) { 'test::key' }
   let (:translated_key) { key.tr(':', '=') }
-  let (:account_id) { '123456789012' }
+  let (:main_role_arn) { 'arn:aws:iam::123456789012:role/PuppetSecretsRole' }
+  let (:staging_role_arn) { 'arn:aws:iam::987654321098:role/PuppetSecretsRole' }
   let (:options) {
     {
       'uri' => 'test/secret/path',
-      'region' => 'us-east-1',
       'agent_port' => 2773,
       'ssrf_env_var' => 'AWS_TOKEN',
       'default_account' => 'main',
       'accounts' => {
         'main' => {
-          'account_id' => account_id,
+          'role_arn' => main_role_arn,
         },
         'staging' => {
-          'account_id' => '987654321098',
-          'region' => 'eu-west-1',
+          'role_arn' => staging_role_arn,
         },
       },
     }
@@ -32,18 +31,6 @@ describe :hiera_aws_secretsmanager do
 
   let (:context) {
     double(Puppet::Pops::Lookup::Context).tap do |ctx|
-      allow(ctx).to receive(:cache).with(String, anything) do |key, value|
-        fake_cache[key] = value
-      end
-
-      allow(ctx).to receive(:cache_has_key).with(String) do |key|
-        fake_cache.key? key
-      end
-
-      allow(ctx).to receive(:cached_value).with(String) do |key|
-        fake_cache[key]
-      end
-
       allow(ctx).to receive(:explain) do
         if block_given?
           puts yield
@@ -69,11 +56,8 @@ describe :hiera_aws_secretsmanager do
     end
   }
 
-  let (:fake_cache) { {} }
-
   let (:secret_string) { 'test-secret' }
   let (:agent_response_body) { { 'SecretString' => secret_string.to_json }.to_json }
-  let (:secret_id) { "arn:aws:secretsmanager:us-east-1:#{account_id}:secret:#{options['uri']}/#{translated_key}" }
 
   let (:http_response) {
     instance_double(Net::HTTPOK).tap do |resp|
@@ -106,39 +90,54 @@ describe :hiera_aws_secretsmanager do
           .and_raise_error(ArgumentError, /uri/)
       end
     end
-
-    context 'when no region is given' do
-      before { options.delete('region') }
-
-      it 'raises an ArgumentError' do
-        expect(subject)
-          .to run.with_params(key, options, context)
-          .and_raise_error(ArgumentError, /region/)
-      end
-    end
   end
 
   context 'account parsing' do
     context 'with an account-prefixed key' do
       let (:key) { 'staging:-test::key' }
-      let (:secret_id) { "arn:aws:secretsmanager:eu-west-1:987654321098:secret:#{options['uri']}/#{translated_key}" }
 
-      it 'resolves the secret using the prefixed account' do
+      it 'sends the staging role_arn as a query parameter' do
+        expect(Net::HTTP).to receive(:start).and_yield(
+          instance_double(Net::HTTP).tap do |http|
+            expect(http).to receive(:request) do |req|
+              query = URI.decode_www_form(URI("http://x#{req.path}").query).to_h
+              expect(query['roleArn']).to eq(staging_role_arn)
+              http_response
+            end
+          end
+        )
         expect(subject).to run.with_params(key, options, context).and_return(secret_string)
       end
     end
 
     context 'with a key without prefix and default_account set' do
-      it 'uses the default account' do
+      it 'sends the default account role_arn as a query parameter' do
+        expect(Net::HTTP).to receive(:start).and_yield(
+          instance_double(Net::HTTP).tap do |http|
+            expect(http).to receive(:request) do |req|
+              query = URI.decode_www_form(URI("http://x#{req.path}").query).to_h
+              expect(query['roleArn']).to eq(main_role_arn)
+              http_response
+            end
+          end
+        )
         expect(subject).to run.with_params(key, options, context).and_return(secret_string)
       end
     end
 
     context 'with a key without prefix and no default_account' do
       before { options.delete('default_account') }
-      let (:secret_id) { "#{options['uri']}/#{translated_key}" }
 
-      it 'uses the plain secret path without ARN' do
+      it 'does not include roleArn in the query' do
+        expect(Net::HTTP).to receive(:start).and_yield(
+          instance_double(Net::HTTP).tap do |http|
+            expect(http).to receive(:request) do |req|
+              query = URI.decode_www_form(URI("http://x#{req.path}").query).to_h
+              expect(query).not_to have_key('roleArn')
+              http_response
+            end
+          end
+        )
         expect(subject).to run.with_params(key, options, context).and_return(secret_string)
       end
     end
@@ -153,13 +152,13 @@ describe :hiera_aws_secretsmanager do
       end
     end
 
-    context 'with an account missing account_id' do
-      before { options['accounts']['main'].delete('account_id') }
+    context 'with an account missing role_arn' do
+      before { options['accounts']['main'].delete('role_arn') }
 
       it 'raises an ArgumentError' do
         expect(subject)
           .to run.with_params(key, options, context)
-          .and_raise_error(ArgumentError, /account_id not set/)
+          .and_raise_error(ArgumentError, /role_arn not set/)
       end
     end
   end
@@ -169,8 +168,8 @@ describe :hiera_aws_secretsmanager do
       expect(Net::HTTP).to receive(:start).and_yield(
         instance_double(Net::HTTP).tap do |http|
           expect(http).to receive(:request) do |req|
-            expect(URI.decode_www_form_component(req.path.split('/v1/secrets/').last))
-              .to include(translated_key)
+            query = URI.decode_www_form(URI("http://x#{req.path}").query).to_h
+            expect(query['secretId']).to include(translated_key)
             http_response
           end
         end
@@ -259,10 +258,6 @@ describe :hiera_aws_secretsmanager do
           .and_return(secret_value)
       end
 
-      it 'caches the parsed JSON object' do
-        expect(context).to receive(:cache).with(secret_id, secret_value)
-        expect(subject).to run.with_params(key, options, context)
-      end
     end
 
     context 'when secret is a JSON array' do
@@ -275,10 +270,6 @@ describe :hiera_aws_secretsmanager do
           .and_return(secret_value)
       end
 
-      it 'caches the parsed JSON array' do
-        expect(context).to receive(:cache).with(secret_id, secret_value)
-        expect(subject).to run.with_params(key, options, context)
-      end
     end
 
     context 'when secret contains Puppet interpolation tokens' do
@@ -296,27 +287,5 @@ describe :hiera_aws_secretsmanager do
     end
   end
 
-  context 'caching' do
-    context 'when the secret is already cached' do
-      let (:cached_secret) { 'cached-secret' }
-      before do
-        fake_cache[secret_id] = cached_secret
-      end
 
-      it 'returns the cached value without calling the agent' do
-        expect(Net::HTTP).not_to receive(:start)
-        expect(subject)
-          .to run
-          .with_params(key, options, context)
-          .and_return(cached_secret)
-      end
-    end
-
-    context 'when the secret is not cached' do
-      it 'fetches from the agent and caches the result' do
-        expect(context).to receive(:cache).with(secret_id, secret_string)
-        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
-      end
-    end
-  end
 end

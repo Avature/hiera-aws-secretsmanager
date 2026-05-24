@@ -11,8 +11,9 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
   #
   # Supports multi-account lookups. Keys can be prefixed with an account
   # name using the separator ':-', e.g. 'staging:-mymod::myclass::password'.
-  # Account names are resolved to AWS account IDs via the 'accounts' option
-  # in hiera.yaml. Keys without a prefix use the 'default_account' option.
+  # Account names are resolved to a role_arn via the 'accounts' option
+  # in hiera.yaml. The agent assumes the given IAM role for cross-account
+  # access. Keys without a prefix use the 'default_account' option.
   #
   # @param key Hiera key, e.g. `mydb::myuser::mypassword` or
   #   `staging:-mydb::myuser::mypassword`
@@ -45,10 +46,6 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
       raise ArgumentError, "either 'uri' or 'uris' must be set in hiera.yaml"
     end
 
-    unless options.key? 'region'
-      raise ArgumentError, 'options: {region: ...} must be set in hiera.yaml'
-    end
-
     account_name, secret_key = parse_account_and_key(key)
 
     # Secrets Manager does not allow ':' in secret names, so we
@@ -57,11 +54,11 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
     secret_key = secret_key.dup.tr(':', '=')
 
     secret_path = "#{options['uri']}/#{secret_key}"
-    secret_id = resolve_secret_id(account_name, secret_path)
+    role_arn = resolve_role_arn(account_name)
 
-    @context.explain { "Resolving secret: #{secret_id} (account: #{account_name || 'local'})" }
+    @context.explain { "Resolving secret: #{secret_path} (account: #{account_name || 'local'})" }
 
-    cached_or_fetch_secret(secret_id)
+    fetch_secret(secret_path, role_arn)
   end
 
   private
@@ -77,8 +74,8 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
     end
   end
 
-  def resolve_secret_id(account_name, secret_path)
-    return secret_path unless account_name
+  def resolve_role_arn(account_name)
+    return nil unless account_name
 
     accounts = @options['accounts']
     unless accounts && accounts.key?(account_name)
@@ -86,37 +83,32 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
     end
 
     account_config = accounts[account_name]
-    account_id = account_config['account_id']
-    region = account_config['region'] || @options['region']
+    role_arn = account_config['role_arn']
 
-    unless account_id
-      raise ArgumentError, "account_id not set for account '#{account_name}' in options.accounts"
+    unless role_arn
+      raise ArgumentError, "role_arn not set for account '#{account_name}' in options.accounts"
     end
 
-    "arn:aws:secretsmanager:#{region}:#{account_id}:secret:#{secret_path}"
+    role_arn
   end
 
-  def cached_or_fetch_secret(secret_id)
-    unless @context.cache_has_key(secret_id)
-      response = fetch_secret_from_agent(secret_id)
+  def fetch_secret(secret_path, role_arn = nil)
+    response = fetch_secret_from_agent(secret_path, role_arn)
 
-      unless response.is_a?(Net::HTTPSuccess)
-        @context.explain { "Secret not found or agent error: #{secret_id} (HTTP #{response.code})" }
-        return @context.not_found
-      end
-
-      @context.explain { "Found secret: #{secret_id}" }
-
-      secret_string = parse_agent_response(response.body)
-      interpolated_string = @context.interpolate(secret_string)
-
-      secret_object = JSON.parse(interpolated_string)
-
-      @context.explain { "Secret parsed as JSON:\n#{secret_object.inspect}" }
-      @context.cache(secret_id, secret_object)
+    unless response.is_a?(Net::HTTPSuccess)
+      @context.explain { "Secret not found or agent error: #{secret_path} (HTTP #{response.code})" }
+      return @context.not_found
     end
 
-    @context.cached_value(secret_id)
+    @context.explain { "Found secret: #{secret_path}" }
+
+    secret_string = parse_agent_response(response.body)
+    interpolated_string = @context.interpolate(secret_string)
+
+    secret_object = JSON.parse(interpolated_string)
+
+    @context.explain { "Secret parsed as JSON:\n#{secret_object.inspect}" }
+    secret_object
   end
 
   def parse_agent_response(body)
@@ -130,13 +122,16 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
     body
   end
 
-  def fetch_secret_from_agent(secret_id)
+  def fetch_secret_from_agent(secret_path, role_arn = nil)
     host = @options['agent_host'] || AGENT_DEFAULT_HOST
     port = (@options['agent_port'] || AGENT_DEFAULT_PORT).to_i
     token = ssrf_token
 
-    encoded_id = URI.encode_www_form_component(secret_id)
-    uri = URI("http://#{host}:#{port}/v1/secrets/#{encoded_id}")
+    params = { 'secretId' => secret_path }
+    params['roleArn'] = role_arn if role_arn
+
+    uri = URI("http://#{host}:#{port}/secretsmanager/get")
+    uri.query = URI.encode_www_form(params)
 
     request = Net::HTTP::Get.new(uri)
     request[SSRF_HEADER] = token if token
