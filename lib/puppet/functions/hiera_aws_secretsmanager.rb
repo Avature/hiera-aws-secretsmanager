@@ -2,52 +2,42 @@ require 'puppet'
 require 'puppet/functions'
 
 require 'json'
+require 'net/http'
+require 'uri'
 
 Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
   # An implementation of a lookup_key Puppet Function for Hiera.
-  # Looks up keys in AWS Secrets Manager.
+  # Looks up keys in AWS Secrets Manager via the local Secrets Manager Agent.
   #
-  # @param base Hiera key, e.g. `mydb::myuser::mypassword`
+  # Supports multi-account lookups. Keys can be prefixed with an account
+  # name using the separator ':-', e.g. 'staging:-mymod::myclass::password'.
+  # Account names are resolved to AWS account IDs via the 'accounts' option
+  # in hiera.yaml. Keys without a prefix use the 'default_account' option.
+  #
+  # @param key Hiera key, e.g. `mydb::myuser::mypassword` or
+  #   `staging:-mydb::myuser::mypassword`
   #
   # @option options 'uri' contains an interpolated value from the uris
   # list in hiera.yaml. Puppet handles iterating over all possible
-  # interpolations for us, yay!
+  # interpolations for us.
   #
-  # @param A Puppet::LookupContext passed from Puppet
-  #
-  # (The type of :context SHOULD be Puppet::LookupContext, but it is
-  # ridiculously hard to instantiate or mock a Puppet::LookupContext
-  # from RSpec, so this is a stupid workaround. I ... hope(?)  this
-  # bug will contain the fix that allows creating a real
-  # Puppet::LookupContext.)
+  # @param context A Puppet::LookupContext passed from Puppet
   dispatch :lookup_key do
     param 'String', :key
     param 'Hash', :options
     param 'Any', :context
   end
 
-  begin
-    require 'aws-sdk-secretsmanager'
-  rescue LoadError
-    raise Puppet::DataBinding::LookupError, 'hiera_aws_secretsmanager requires the aws-sdk-secretsmanager gem installed'
-  end
-
   # Lame explicit check for already defined constants courtesy of
   # Puppet feeling the need to reload this file over and over.
-  unless defined? LIST_SECRETS_MAX
-    LIST_SECRETS_MAX = 100
-    SMCLIENT_KEY = '_hiera_aws_secretsmanager_smclient_'.freeze
+  unless defined? ACCOUNT_SEPARATOR
+    ACCOUNT_SEPARATOR = ':-'.freeze
+    AGENT_DEFAULT_HOST = 'localhost'.freeze
+    AGENT_DEFAULT_PORT = 2773
+    SSRF_HEADER = 'X-Aws-Parameters-Secrets-Token'.freeze
   end
 
-  @secrets_list = nil
-
   def lookup_key(key, options, context)
-    # Secrets Manager does not allow ':' in secret names, so we
-    # translate them here. We choose '=' merely because it is
-    # graphically similar to ':'. This could be amended to
-    # quoted-printable in the future if needed.
-    key = key.dup.tr(':', '=')
-
     @context = context
     @options = options
 
@@ -55,141 +45,115 @@ Puppet::Functions.create_function(:hiera_aws_secretsmanager) do
       raise ArgumentError, "either 'uri' or 'uris' must be set in hiera.yaml"
     end
 
-    setup_stats_if_enabled
-
-    secret_name = "#{options['uri']}/#{key}"
-    if secret_exists? secret_name then
-      return cached_secret(secret_name)
-    else
-      return @context.not_found
+    unless options.key? 'region'
+      raise ArgumentError, 'options: {region: ...} must be set in hiera.yaml'
     end
+
+    account_name, secret_key = parse_account_and_key(key)
+
+    # Secrets Manager does not allow ':' in secret names, so we
+    # translate them here. We choose '=' merely because it is
+    # graphically similar to ':'.
+    secret_key = secret_key.dup.tr(':', '=')
+
+    secret_path = "#{options['uri']}/#{secret_key}"
+    secret_id = resolve_secret_id(account_name, secret_path)
+
+    @context.explain { "Resolving secret: #{secret_id} (account: #{account_name || 'local'})" }
+
+    cached_or_fetch_secret(secret_id)
   end
 
   private
 
-  def smclient
-    unless @context.cache_has_key(SMCLIENT_KEY)
-      # No arguments being passed. We expect SDK configuration to
-      # happen exclusively in the environment (including
-      # $HOME/.aws/credentials, etc)
-      unless @options.key? 'region'
-        raise ArgumentError, 'options: {region: ...} must be set in hiera.yaml'
-      end
+  def parse_account_and_key(key)
+    if key.include?(ACCOUNT_SEPARATOR)
+      parts = key.split(ACCOUNT_SEPARATOR, 2)
+      [parts[0], parts[1]]
+    elsif @options['default_account']
+      [@options['default_account'], key]
+    else
+      [nil, key]
+    end
+  end
 
-      @context.cache(SMCLIENT_KEY, Aws::SecretsManager::Client.new(smclient_options))
+  def resolve_secret_id(account_name, secret_path)
+    return secret_path unless account_name
+
+    accounts = @options['accounts']
+    unless accounts && accounts.key?(account_name)
+      raise ArgumentError, "account '#{account_name}' not found in options.accounts configuration"
     end
 
-    @context.cached_value(SMCLIENT_KEY)
-  end
+    account_config = accounts[account_name]
+    account_id = account_config['account_id']
+    region = account_config['region'] || @options['region']
 
-  def smclient_options
-    smclient_options = {region: @options['region']}
-    smclient_options.merge!(retry_options)
-    smclient_options.merge!(endpoint_options)
-    @context.explain { "Aws::SecretsManager::Client options: #{smclient_options}" }
-    smclient_options
-  end
-
-  # https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/SecretsManager/Client.html#initialize-instance_method
-  def retry_options
-    return {} unless @options['retries']
-
-    allowed_opts = %w[
-      adaptive_retry_wait_to_fill
-      max_attempts
-      retry_backoff
-      retry_base_delay
-      retry_jitter
-      retry_limit
-      retry_max_delay
-      retry_mode
-    ]
-
-    @options['retries']
-      .select { |opt, _| allowed_opts.member?(opt) }
-      .transform_keys!(&:to_sym)
-  end
-
-  # https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/SecretsManager/Client.html#initialize-instance_method
-  def endpoint_options
-    return {} unless @options['endpoint']
-
-    allowed_opts = %w[
-      endpoint
-      endpoint_cache_max_entries
-      endpoint_cache_max_threads
-      endpoint_cache_poll_interval
-      endpoint_discovery
-    ]
-
-    @options['endpoint']
-      .select { |opt, _| allowed_opts.member?(opt) }
-      .transform_keys!(&:to_sym)
-  end
-
-  def setup_stats_if_enabled
-    return unless @options['statsd']
-
-    # smclient's class might not be constant due to mocking
-    smclient_class = smclient.class
-
-    # Guard due to module reloading
-    return if smclient_class.class_variable_defined?(:@@__hasm_stats_setup_done)
-    smclient_class.class_variable_set(:@@__hasm_stats_setup_done, true)
-
-    # STATSD_ENV defaults to `development`. I don't know any other way
-    # to set it so that Hiera inside Puppet Enterprise gets it.
-    ENV['STATSD_ENV'] = 'production' unless ENV['STATSD_ENV']
-
-    begin
-      require 'statsd/instrument'
-    rescue LoadError
-      raise Puppet::DataBinding::LookupError, 'hiera_aws_secretsmanager requires the statsd-instrument gem if statsd: true'
+    unless account_id
+      raise ArgumentError, "account_id not set for account '#{account_name}' in options.accounts"
     end
 
-    # Workaround for AWS SDK redefining Module#extend (:table-flip-emoji:)
-    smclient_class.singleton_class.include StatsD::Instrument
-
-    smclient_class.statsd_count :list_secrets, 'hiera_aws_secretsmanager.list_secrets'
-    smclient_class.statsd_measure :list_secrets, 'hiera_aws_secretsmanager.list_secrets'
-    smclient_class.statsd_count :get_secret_value, 'hiera_aws_secretsmanager.get_secret_value'
-    smclient_class.statsd_measure :get_secret_value, 'hiera_aws_secretsmanager.get_secret_value'
+    "arn:aws:secretsmanager:#{region}:#{account_id}:secret:#{secret_path}"
   end
 
-  def cached_secret(secret_name)
-    unless @context.cache_has_key(secret_name)
-      secret = smclient.get_secret_value(secret_id: secret_name)
-      @context.explain { "Found secret: #{secret_name}\n#{secret.inspect}" }
+  def cached_or_fetch_secret(secret_id)
+    unless @context.cache_has_key(secret_id)
+      response = fetch_secret_from_agent(secret_id)
 
-      interpolated_string = @context.interpolate(secret.secret_string)
-
-      if JSON::VERSION_MAJOR < 2 then # Gross but we had to punt.
-        secret_object = JSON.parse(interpolated_string, quirks_mode: true)
-      else
-        secret_object = JSON.parse(interpolated_string)
+      unless response.is_a?(Net::HTTPSuccess)
+        @context.explain { "Secret not found or agent error: #{secret_id} (HTTP #{response.code})" }
+        return @context.not_found
       end
+
+      @context.explain { "Found secret: #{secret_id}" }
+
+      secret_string = parse_agent_response(response.body)
+      interpolated_string = @context.interpolate(secret_string)
+
+      secret_object = JSON.parse(interpolated_string)
 
       @context.explain { "Secret parsed as JSON:\n#{secret_object.inspect}" }
-      @context.cache(secret_name, secret_object)
+      @context.cache(secret_id, secret_object)
     end
 
-    @context.cached_value(secret_name)
+    @context.cached_value(secret_id)
   end
 
-  def cached_secrets_list
-    unless @secrets_list
-      @context.explain { "SecretsList not cached. Listing all secrets." }
-      batch = smclient.list_secrets(max_results: LIST_SECRETS_MAX)
-      @secrets_list = batch.secret_list.map(&:name)
-      while batch.next_token do
-        batch = smclient.list_secrets(max_results: LIST_SECRETS_MAX, next_token: batch.next_token)
-        @secrets_list.concat batch.secret_list.map(&:name)
-      end
+  def parse_agent_response(body)
+    parsed = JSON.parse(body)
+    if parsed.is_a?(Hash) && parsed.key?('SecretString')
+      parsed['SecretString']
+    else
+      body
     end
-    @secrets_list
+  rescue JSON::ParserError
+    body
   end
 
-  def secret_exists?(secret_name)
-    @context.cache_has_key(secret_name) or cached_secrets_list.include? secret_name
+  def fetch_secret_from_agent(secret_id)
+    host = @options['agent_host'] || AGENT_DEFAULT_HOST
+    port = (@options['agent_port'] || AGENT_DEFAULT_PORT).to_i
+    token = ssrf_token
+
+    encoded_id = URI.encode_www_form_component(secret_id)
+    uri = URI("http://#{host}:#{port}/v1/secrets/#{encoded_id}")
+
+    request = Net::HTTP::Get.new(uri)
+    request[SSRF_HEADER] = token if token
+
+    Net::HTTP.start(uri.hostname, uri.port) do |http|
+      http.request(request)
+    end
+  end
+
+  def ssrf_token
+    env_var = @options['ssrf_env_var']
+    return nil unless env_var
+
+    token = ENV[env_var]
+    unless token && !token.empty?
+      raise ArgumentError, "SSRF token environment variable '#{env_var}' is not set or empty"
+    end
+    token
   end
 end

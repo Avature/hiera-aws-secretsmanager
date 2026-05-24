@@ -1,7 +1,6 @@
 require 'spec_helper'
-require 'pry'
 
-require 'ostruct'
+require 'net/http'
 
 describe :hiera_aws_secretsmanager do
   context 'without arguments' do
@@ -11,20 +10,23 @@ describe :hiera_aws_secretsmanager do
 
   let (:key) { 'test::key' }
   let (:translated_key) { key.tr(':', '=') }
+  let (:account_id) { '123456789012' }
   let (:options) {
     {
       'uri' => 'test/secret/path',
       'region' => 'us-east-1',
-      'statsd' => true,
-      'retries' => {
-        'retry_mode' => 'adaptive',
-        'max_attempts' => 10,
+      'agent_port' => 2773,
+      'ssrf_env_var' => 'AWS_TOKEN',
+      'default_account' => 'main',
+      'accounts' => {
+        'main' => {
+          'account_id' => account_id,
+        },
+        'staging' => {
+          'account_id' => '987654321098',
+          'region' => 'eu-west-1',
+        },
       },
-      'endpoint' => {
-        'endpoint' => 'https://my.private.endpoint.aws.com',
-        'endpoint_cache_max_threads' => 5,
-        'endpoint_discovery' => false,
-      }
     }
   }
 
@@ -48,6 +50,8 @@ describe :hiera_aws_secretsmanager do
         end
       end
 
+      allow(ctx).to receive(:not_found).and_return(:not_found)
+
       allow(ctx).to receive(:interpolate).with(anything) do |string|
         if string['%{'] then
           STDERR.puts <<~END
@@ -65,216 +69,253 @@ describe :hiera_aws_secretsmanager do
     end
   }
 
-  let (:fake_cache) {
-    {
-      smclient_key => smclient,
-    }
-  }
+  let (:fake_cache) { {} }
 
-  let (:secret) { OpenStruct.new(name: secret_name, secret_string: secret_string.to_json) }
-  let (:secret_name) { "#{options['uri']}/#{translated_key}" }
   let (:secret_string) { 'test-secret' }
+  let (:agent_response_body) { { 'SecretString' => secret_string.to_json }.to_json }
+  let (:secret_id) { "arn:aws:secretsmanager:us-east-1:#{account_id}:secret:#{options['uri']}/#{translated_key}" }
 
-  let (:smclient) {
-    instance_double(Aws::SecretsManager::Client).tap do |smclient|
-      allow(smclient)
-        .to receive(:list_secrets)
-        .and_return(OpenStruct.new(secret_list: [secret]))
-
-      allow(smclient)
-        .to receive(:get_secret_value)
-        .with(hash_including(secret_id: secret_name))
-        .and_return(secret)
-
-      # StatsD::Instrument needs this
-      allow(smclient.class)
-        .to receive(:method_defined?)
-        .and_return(true)
+  let (:http_response) {
+    instance_double(Net::HTTPOK).tap do |resp|
+      allow(resp).to receive(:is_a?).with(Net::HTTPSuccess).and_return(true)
+      allow(resp).to receive(:body).and_return(agent_response_body)
+      allow(resp).to receive(:code).and_return('200')
     end
   }
-
-  let (:smclient_key) { '_hiera_aws_secretsmanager_smclient_' }
 
   before do
-    allow(Aws::SecretsManager::Client).to receive(:new).and_return(smclient)
+    ENV['AWS_TOKEN'] = 'test-ssrf-token'
+    allow(Net::HTTP).to receive(:start).and_yield(
+      instance_double(Net::HTTP).tap do |http|
+        allow(http).to receive(:request).and_return(http_response)
+      end
+    )
   end
 
-  context 'without a cached client' do
-    before do
-      expect(context)
-        .to receive(:cache_has_key)
-        .with(smclient_key)
-        .and_return(false).ordered
-    end
+  after do
+    ENV.delete('AWS_TOKEN')
+  end
 
-    context 'and no region is given' do
-      before do
-        options.delete('region')
-      end
+  context 'configuration validation' do
+    context 'when no uri is given' do
+      before { options.delete('uri') }
 
-      it 'returns an ArgumentError' do
+      it 'raises an ArgumentError' do
         expect(subject)
-          .to run
-          .with_params(key, options, context)
-          .and_raise_error(ArgumentError)
+          .to run.with_params(key, options, context)
+          .and_raise_error(ArgumentError, /uri/)
       end
     end
 
-    context 'and region option is given' do
-      it 'creates and caches a new client' do
-        expect(Aws::SecretsManager::Client)
-          .to receive(:new)
-          .and_return(smclient).ordered
+    context 'when no region is given' do
+      before { options.delete('region') }
 
-        expect(context)
-          .to receive(:cache)
-          .with(smclient_key, smclient).ordered
-
-        expect(subject).to run.with_params(key, options, context)
-      end
-
-      it 'sets the AWS region in the new client' do
-        expect(Aws::SecretsManager::Client)
-          .to receive(:new)
-          .with(a_hash_including(:region => 'us-east-1'))
-        expect(subject).to run.with_params(key, options, context)
+      it 'raises an ArgumentError' do
+        expect(subject)
+          .to run.with_params(key, options, context)
+          .and_raise_error(ArgumentError, /region/)
       end
     end
   end
 
-  context 'with a cached client' do
-    it 'uses the cached client' do
-      expect(Aws::SecretsManager::Client).not_to receive(:new)
+  context 'account parsing' do
+    context 'with an account-prefixed key' do
+      let (:key) { 'staging:-test::key' }
+      let (:secret_id) { "arn:aws:secretsmanager:eu-west-1:987654321098:secret:#{options['uri']}/#{translated_key}" }
 
+      it 'resolves the secret using the prefixed account' do
+        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
+      end
+    end
+
+    context 'with a key without prefix and default_account set' do
+      it 'uses the default account' do
+        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
+      end
+    end
+
+    context 'with a key without prefix and no default_account' do
+      before { options.delete('default_account') }
+      let (:secret_id) { "#{options['uri']}/#{translated_key}" }
+
+      it 'uses the plain secret path without ARN' do
+        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
+      end
+    end
+
+    context 'with an unknown account prefix' do
+      let (:key) { 'unknown:-test::key' }
+
+      it 'raises an ArgumentError' do
+        expect(subject)
+          .to run.with_params(key, options, context)
+          .and_raise_error(ArgumentError, /account 'unknown' not found/)
+      end
+    end
+
+    context 'with an account missing account_id' do
+      before { options['accounts']['main'].delete('account_id') }
+
+      it 'raises an ArgumentError' do
+        expect(subject)
+          .to run.with_params(key, options, context)
+          .and_raise_error(ArgumentError, /account_id not set/)
+      end
+    end
+  end
+
+  context 'key translation' do
+    it 'converts : to = in the secret key portion' do
+      expect(Net::HTTP).to receive(:start).and_yield(
+        instance_double(Net::HTTP).tap do |http|
+          expect(http).to receive(:request) do |req|
+            expect(URI.decode_www_form_component(req.path.split('/v1/secrets/').last))
+              .to include(translated_key)
+            http_response
+          end
+        end
+      )
       expect(subject).to run.with_params(key, options, context)
     end
   end
 
-  context 'with an existing key' do
-    context 'that is not cached' do
-      it 'checks the cache first' do
-        expect(context)
-          .to receive(:cache_has_key)
-          .with(secret_name)
-          .and_return(false).ordered
-
-        expect(smclient).to receive(:list_secrets).ordered
-        expect(smclient).to receive(:get_secret_value).ordered
-
-        expect(subject).to run.with_params(key, options, context)
-      end
-
-      it 'sends metrics' do
-        skip "between mocking and Puppet indirection weirdness, I haven't figured out how to test this"
-        expect {
-          expect(subject).to run.with_params(key, options, context)
-        }.to trigger_statsd_increment('hiera_aws_secrets_manager.list_secrets')
-      end
-
-      it 'converts : to = in the key' do
-        expect(smclient)
-          .to receive(:get_secret_value)
-          .with(a_hash_including(secret_id: secret_name))
-        expect(subject).to run.with_params(key, options, context)
-      end
-
-      it 'returns the secret' do
-        expect(smclient)
-          .to receive(:get_secret_value)
-          .with(a_hash_including(secret_id: secret_name))
-          .and_return(secret)
-
-        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
-      end
-
-      context 'result post-processing' do
-        context 'when secret is a JSON string value' do
-          let (:secret_value) { 'test-%{}' }
-          let (:secret) { OpenStruct.new(name: secret_name, secret_string: secret_value.to_json) }
-          let (:interpolated_value) { 'test-secret' }
-
-          it 'does Puppet interpolation before JSON parsing' do
-            expect(context).to receive(:interpolate)
-              .with(secret.secret_string)
-              .and_return(interpolated_value.to_json).ordered
-
-            allow(JSON).to receive(:parse).with(String, anything).and_call_original
-            expect(JSON).to receive(:parse).with(String interpolated_value.to_json)
-
-            expect(subject).to run.with_params(key, options, context)
-          end
-
-          it 'returns the string after interpolation' do
-            expect(context)
-              .to receive(:interpolate)
-              .with(secret.secret_string)
-              .and_return(interpolated_value.to_json)
-
-            expect(subject).to run.with_params(key, options, context).and_return(interpolated_value)
+  context 'agent communication' do
+    it 'sends the SSRF token header' do
+      expect(Net::HTTP).to receive(:start).and_yield(
+        instance_double(Net::HTTP).tap do |http|
+          expect(http).to receive(:request) do |req|
+            expect(req['X-Aws-Parameters-Secrets-Token']).to eq('test-ssrf-token')
+            http_response
           end
         end
+      )
+      expect(subject).to run.with_params(key, options, context)
+    end
 
-        context 'when secret is a JSON object' do
-          let (:secret_value) { { 'test_hash_key' => 'test_hash_value' } }
-          let (:secret) { OpenStruct.new(name: secret_name, secret_string: secret_value.to_json) }
-
-          before do
-            allow(smclient)
-              .to receive(:get_secret_value)
-              .with(a_hash_including(secret_id: secret_name))
-              .and_return(secret)
-          end
-
-          it 'caches the parsed JSON object as a Ruby Hash' do
-            expect(context).to receive(:cache).with(secret_name, secret_value)
-            expect(subject).to run.with_params(key, options, context)
-          end
-
-          it 'returns the parsed JSON object as a Ruby Hash' do
-            expect(subject).to run
-              .with_params(key, options, context)
-              .and_return(secret_value)
-          end
+    context 'when the agent returns a non-success response' do
+      let (:http_response) {
+        instance_double(Net::HTTPNotFound).tap do |resp|
+          allow(resp).to receive(:is_a?).with(Net::HTTPSuccess).and_return(false)
+          allow(resp).to receive(:code).and_return('404')
         end
+      }
 
-        context 'when secret is a JSON array' do
-          let (:secret_value) { ['test-a1'] }
-          let (:secret) { OpenStruct.new(name: secret_name, secret_string: secret_value.to_json) }
-
-          before do
-            allow(smclient)
-              .to receive(:get_secret_value)
-              .with(a_hash_including(secret_id: secret_name))
-              .and_return(secret)
-          end
-
-          it 'caches the parsed JSON object as a Ruby Array' do
-            expect(context).to receive(:cache).with(secret_name, secret_value)
-            expect(subject).to run.with_params(key, options, context)
-          end
-
-          it 'returns the parsed JSON object as a Ruby Array' do
-            expect(subject).to run
-              .with_params(key, options, context)
-              .and_return(secret_value)
-          end
-        end
+      it 'returns not_found' do
+        expect(subject).to run.with_params(key, options, context).and_return(:not_found)
       end
     end
 
-    context 'that is cached' do
-      let (:cached_secret) { 'cached-secret' }
-      before do
-        fake_cache[secret_name] = cached_secret
+    context 'when ssrf_env_var is not set' do
+      before { options.delete('ssrf_env_var') }
+
+      it 'sends the request without a token header' do
+        expect(Net::HTTP).to receive(:start).and_yield(
+          instance_double(Net::HTTP).tap do |http|
+            expect(http).to receive(:request) do |req|
+              expect(req['X-Aws-Parameters-Secrets-Token']).to be_nil
+              http_response
+            end
+          end
+        )
+        expect(subject).to run.with_params(key, options, context)
+      end
+    end
+
+    context 'when ssrf env var is set but empty' do
+      before { ENV['AWS_TOKEN'] = '' }
+
+      it 'raises an ArgumentError' do
+        expect(subject)
+          .to run.with_params(key, options, context)
+          .and_raise_error(ArgumentError, /SSRF token environment variable/)
+      end
+    end
+  end
+
+  context 'response parsing' do
+    context 'when the agent returns a GetSecretValue JSON response' do
+      let (:agent_response_body) { { 'SecretString' => secret_string.to_json }.to_json }
+
+      it 'extracts and parses SecretString' do
+        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
+      end
+    end
+
+    context 'when the agent returns a plain body' do
+      let (:agent_response_body) { secret_string.to_json }
+
+      it 'parses the body directly as JSON' do
+        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
+      end
+    end
+
+    context 'when secret is a JSON object' do
+      let (:secret_value) { { 'test_hash_key' => 'test_hash_value' } }
+      let (:agent_response_body) { { 'SecretString' => secret_value.to_json }.to_json }
+
+      it 'returns the parsed JSON object as a Ruby Hash' do
+        expect(subject).to run
+          .with_params(key, options, context)
+          .and_return(secret_value)
       end
 
-      it 'returns the cached value without calling AWS' do
-        expect(smclient).not_to receive(:list_secrets)
-        expect(smclient).not_to receive(:get_secret_value)
+      it 'caches the parsed JSON object' do
+        expect(context).to receive(:cache).with(secret_id, secret_value)
+        expect(subject).to run.with_params(key, options, context)
+      end
+    end
+
+    context 'when secret is a JSON array' do
+      let (:secret_value) { ['test-a1'] }
+      let (:agent_response_body) { { 'SecretString' => secret_value.to_json }.to_json }
+
+      it 'returns the parsed JSON object as a Ruby Array' do
+        expect(subject).to run
+          .with_params(key, options, context)
+          .and_return(secret_value)
+      end
+
+      it 'caches the parsed JSON array' do
+        expect(context).to receive(:cache).with(secret_id, secret_value)
+        expect(subject).to run.with_params(key, options, context)
+      end
+    end
+
+    context 'when secret contains Puppet interpolation tokens' do
+      let (:secret_value) { 'test-%{}' }
+      let (:interpolated_value) { 'test-secret' }
+      let (:agent_response_body) { { 'SecretString' => secret_value.to_json }.to_json }
+
+      it 'does Puppet interpolation before JSON parsing' do
+        expect(context).to receive(:interpolate)
+          .with(secret_value.to_json)
+          .and_return(interpolated_value.to_json)
+
+        expect(subject).to run.with_params(key, options, context).and_return(interpolated_value)
+      end
+    end
+  end
+
+  context 'caching' do
+    context 'when the secret is already cached' do
+      let (:cached_secret) { 'cached-secret' }
+      before do
+        fake_cache[secret_id] = cached_secret
+      end
+
+      it 'returns the cached value without calling the agent' do
+        expect(Net::HTTP).not_to receive(:start)
         expect(subject)
           .to run
           .with_params(key, options, context)
           .and_return(cached_secret)
+      end
+    end
+
+    context 'when the secret is not cached' do
+      it 'fetches from the agent and caches the result' do
+        expect(context).to receive(:cache).with(secret_id, secret_string)
+        expect(subject).to run.with_params(key, options, context).and_return(secret_string)
       end
     end
   end
